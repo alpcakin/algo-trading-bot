@@ -17,7 +17,18 @@ INDIVIDUAL_TP_PIPS = 15  # TP for each position
 NEWS_BEFORE_MINUTES = 15
 NEWS_AFTER_MINUTES = 30
 
-# Backtest
-START_DATE = "2024-01-01"
-END_DATE = "2024-12-31"
+# Backtest (SON 30 GÜN - MT5 veri limiti için)
+from datetime import datetime, timedelta
+
+end_dt = datetime.now()
+start_dt = end_dt - timedelta(days=30)
+
+START_DATE = start_dt.strftime("%Y-%m-%d")
+END_DATE = end_dt.strftime("%Y-%m-%d")
 INITIAL_BALANCE = 10000
+
+print(f"📅 Backtest period: {START_DATE} to {END_DATE}")
+
+# Advanced Strategy Parameters
+MIN_MITIGATION_DISTANCE_PIPS = 5  # Mitigation update için min mesafe
+INDIVIDUAL_TP_PIPS = 30  # 15'ten 30'a çıkardık
