@@ -11,12 +11,11 @@ Key Concepts:
 - Bias changes when price CLOSES outside mitigation candle
 - Entry: ALL candles when bias is active (color independent)
 - Exit: TP hit, bias change, or end of day
-- News Filter: No trading 15min before, 30min after high-impact news
-- Scalp parameters: 0.1 pip min distance, 5 pip TP
+- News Filter: No trading 30min before/after high-impact news
+- Scalp: 5 pip TP, 0.01% risk per trade
 """
 
 import pandas as pd
-import numpy as np
 from news_filter import NewsFilter
 
 
@@ -26,48 +25,46 @@ class TrendFollowingStrategy:
     """
 
     def __init__(self, individual_tp_pips=5, risk_per_trade=0.0001,
-                 emergency_sl_percent=0.02, trading_hours=(13, 20),
-                 analysis_hours=(12, 13), min_mitigation_distance_pips=0.1,
-                 swing_lookback=2, enable_news_filter=True,
-                 news_buffer_before=15, news_buffer_after=30,
-                 enable_volatility_filter=True, atr_period=14,
-                 atr_multiplier=2.0):
+                 max_stop_loss_percent=0.035, trading_hours=(13, 20),
+                 analysis_hours=(12, 13), swing_lookback=2,
+                 enable_news_filter=True, news_buffer_before=15,
+                 news_buffer_after=30):
         """
         Args:
             individual_tp_pips: TP in pips for each individual position (scalp)
-            risk_per_trade: Risk per trade as fraction of balance (0.0001 = 0.01%)
-            emergency_sl_percent: Emergency SL as fraction of balance (0.02 = 2%)
+            risk_per_trade: Risk per trade as fraction of balance (0.002 = 0.2%)
+            max_stop_loss_percent: Maximum SL as fraction of balance (0.035 = 3.5%)
             trading_hours: Tuple of (start_hour, end_hour) - entries until 19:55, close at 20:00
             analysis_hours: Tuple of (start_hour, end_hour) for daily analysis
-            min_mitigation_distance_pips: Minimum distance for mitigation update
             swing_lookback: Number of candles on each side for swing detection (default: 2)
             enable_news_filter: Enable/disable news filter
             news_buffer_before: Minutes before news to stop trading
             news_buffer_after: Minutes after news to stop trading
-            enable_volatility_filter: Enable/disable volatility filter
-            atr_period: Period for ATR calculation (default: 14)
-            atr_multiplier: Multiplier for high volatility threshold (default: 2.0)
         """
         self.individual_tp_pips = individual_tp_pips
         self.risk_per_trade = risk_per_trade
-        self.emergency_sl_percent = emergency_sl_percent
+        self.max_stop_loss_percent = max_stop_loss_percent
         self.trading_hours = trading_hours
         self.analysis_hours = analysis_hours
-        self.min_mitigation_distance_pips = min_mitigation_distance_pips
         self.swing_lookback = swing_lookback
         self.enable_news_filter = enable_news_filter
-        self.enable_volatility_filter = enable_volatility_filter
-        self.atr_period = atr_period
-        self.atr_multiplier = atr_multiplier
 
         # Initialize news filter
         if self.enable_news_filter:
             self.news_filter = NewsFilter(news_buffer_before, news_buffer_after)
-            # Load hardcoded news for 2025-2026
-            self.news_filter.load_hardcoded_news(2025)
-            self.news_filter.load_hardcoded_news(2026)
-            from news_filter import KNOWN_NEWS_2025_2026
-            self.news_filter.load_custom_news(KNOWN_NEWS_2025_2026)
+            # Load specific news for each month from news_events_by_month.py (optional)
+            try:
+                import sys
+                import os
+                parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                if parent_dir not in sys.path:
+                    sys.path.insert(0, parent_dir)
+                from news_events_by_month import get_all_news_2025
+                all_news = get_all_news_2025()
+                self.news_filter.load_custom_news(all_news)
+            except ImportError:
+                # news_events_by_month.py not found, will use default news filter
+                pass
         else:
             self.news_filter = None
 
@@ -86,6 +83,12 @@ class TrendFollowingStrategy:
         # Pending swing highs/lows (not yet confirmed)
         self.pending_swing_highs = []  # [(price, index), ...]
         self.pending_swing_lows = []   # [(price, index), ...]
+
+        # Track mitigation test for entry
+        self.mitigation_tested = False  # Has price entered mitigation zone after bias change?
+        self.ready_to_trade = False  # Mitigation tested + new high/low confirmed
+        self.entry_candle_count = 0  # Count candles since ready_to_trade
+        self.last_bias_change_idx = None  # Track when bias last changed
 
         # Last analysis day tracking
         self.last_analysis_day = None
@@ -183,6 +186,10 @@ class TrendFollowingStrategy:
         self.reference_low_idx = None
         self.pending_swing_highs = []
         self.pending_swing_lows = []
+        self.mitigation_tested = False
+        self.ready_to_trade = False
+        self.entry_candle_count = 0
+        self.last_bias_change_idx = None
 
 
     def is_analysis_period(self, timestamp):
@@ -191,60 +198,221 @@ class TrendFollowingStrategy:
         return self.analysis_hours[0] <= hour < self.analysis_hours[1]
 
 
-    def calculate_atr(self, df, current_idx):
-        """Calculate ATR (Average True Range) for volatility filtering"""
-        if current_idx < self.atr_period:
-            return None
+    def calculate_adx(self, df, current_idx, period=14):
+        """
+        Calculate ADX (Average Directional Index)
+        ADX < 25 = weak trend / ranging market
+        ADX > 25 = strong trend
+        """
+        if current_idx < period + 1:
+            return 50  # Default to "trending" if not enough data
 
-        true_ranges = []
-        for i in range(current_idx - self.atr_period + 1, current_idx + 1):
-            candle = df.iloc[i]
-            if i == 0:
-                tr = candle['high'] - candle['low']
+        # Get recent candles
+        start_idx = max(0, current_idx - period - 1)
+        candles = df.iloc[start_idx:current_idx + 1]
+
+        # Calculate True Range (TR)
+        high = candles['high'].values
+        low = candles['low'].values
+        close = candles['close'].values
+
+        tr = []
+        for i in range(1, len(candles)):
+            h_l = high[i] - low[i]
+            h_pc = abs(high[i] - close[i-1])
+            l_pc = abs(low[i] - close[i-1])
+            tr.append(max(h_l, h_pc, l_pc))
+
+        # Calculate +DM and -DM
+        plus_dm = []
+        minus_dm = []
+        for i in range(1, len(candles)):
+            up_move = high[i] - high[i-1]
+            down_move = low[i-1] - low[i]
+
+            if up_move > down_move and up_move > 0:
+                plus_dm.append(up_move)
             else:
-                prev_close = df.iloc[i-1]['close']
-                tr = max(
-                    candle['high'] - candle['low'],
-                    abs(candle['high'] - prev_close),
-                    abs(candle['low'] - prev_close)
-                )
-            true_ranges.append(tr)
+                plus_dm.append(0)
 
-        return sum(true_ranges) / len(true_ranges)
+            if down_move > up_move and down_move > 0:
+                minus_dm.append(down_move)
+            else:
+                minus_dm.append(0)
 
+        # Smooth TR, +DM, -DM with EMA
+        if len(tr) < period:
+            return 50  # Not enough data
 
-    def is_high_volatility(self, df, current_idx):
-        """Check if current volatility is too high (avoid consolidation breakouts)"""
-        if not self.enable_volatility_filter:
+        # Simple average for first period
+        atr = sum(tr[-period:]) / period
+        plus_di_smoothed = sum(plus_dm[-period:]) / period
+        minus_di_smoothed = sum(minus_dm[-period:]) / period
+
+        # Calculate +DI and -DI
+        if atr == 0:
+            return 0  # No movement = ranging
+
+        plus_di = 100 * (plus_di_smoothed / atr)
+        minus_di = 100 * (minus_di_smoothed / atr)
+
+        # Calculate DX
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            return 0
+
+        dx = 100 * abs(plus_di - minus_di) / di_sum
+
+        # ADX is smoothed DX (simplified: using DX directly for now)
+        return dx
+
+    def is_choppy_market(self, current_time, df=None, current_idx=None):
+        """
+        Check if market is choppy using ADX
+        ADX < 30 = weak trend / ranging market (choppy)
+        """
+        if df is None or current_idx is None:
             return False
 
-        current_atr = self.calculate_atr(df, current_idx)
-        if current_atr is None:
+        adx = self.calculate_adx(df, current_idx, period=14)
+
+        # ADX below 30 = choppy/ranging market (increased from 25)
+        return adx < 30
+
+    def calculate_atr(self, df, current_idx, period=14):
+        """Calculate Average True Range (ATR) for volatility"""
+        if current_idx < period:
+            return 0.0003  # Default ATR value
+
+        # Get recent candles
+        start_idx = max(0, current_idx - period)
+        candles = df.iloc[start_idx:current_idx + 1]
+
+        high = candles['high'].values
+        low = candles['low'].values
+        close = candles['close'].values
+
+        # Calculate True Range
+        tr = []
+        for i in range(1, len(candles)):
+            h_l = high[i] - low[i]
+            h_pc = abs(high[i] - close[i-1])
+            l_pc = abs(low[i] - close[i-1])
+            tr.append(max(h_l, h_pc, l_pc))
+
+        # ATR is average of TR
+        if len(tr) >= period:
+            return sum(tr[-period:]) / period
+        else:
+            return sum(tr) / len(tr) if tr else 0.0003
+
+    def get_dynamic_tp_atr(self, df, current_idx):
+        """
+        Get dynamic TP based on ATR (volatility)
+        Conservative range: 20-25 pips
+        Low volatility: 20 pips
+        High volatility: 25 pips
+        """
+        atr = self.calculate_atr(df, current_idx, period=14)
+
+        # Calculate average ATR from last 50 candles
+        start_idx = max(0, current_idx - 50)
+        avg_atr = 0.0003  # Default
+
+        if current_idx >= 50:
+            atr_values = []
+            for i in range(start_idx, current_idx):
+                atr_values.append(self.calculate_atr(df, i, period=14))
+            avg_atr = sum(atr_values) / len(atr_values)
+
+        # Dynamic TP based on current ATR vs average
+        if atr > avg_atr * 1.1:  # High volatility
+            return 25
+        else:  # Normal/Low volatility
+            return 20
+
+    def get_dynamic_tp_hybrid(self, df, current_idx):
+        """
+        Hybrid: ADX (trend strength) + ATR (volatility)
+        Conservative range: 20-25 pips
+        Uses both indicators for fine-tuning
+        """
+        adx = self.calculate_adx(df, current_idx, period=14)
+        atr = self.calculate_atr(df, current_idx, period=14)
+
+        # Calculate average ATR
+        start_idx = max(0, current_idx - 50)
+        avg_atr = 0.0003
+        if current_idx >= 50:
+            atr_values = []
+            for i in range(start_idx, current_idx):
+                atr_values.append(self.calculate_atr(df, i, period=14))
+            avg_atr = sum(atr_values) / len(atr_values)
+
+        # Start with base TP
+        base_tp = 22  # Middle ground
+
+        # ADX adjustment (-2 to +2)
+        if adx >= 35:
+            base_tp += 2  # Strong trend
+        elif adx < 28:
+            base_tp -= 2  # Weak trend
+
+        # ATR adjustment (-1 to +1)
+        if atr > avg_atr * 1.15:  # High volatility
+            base_tp += 1
+        elif atr < avg_atr * 0.85:  # Low volatility
+            base_tp -= 1
+
+        # Clamp between 20-25
+        return max(20, min(25, base_tp))
+
+    def get_dynamic_tp(self, df, current_idx):
+        """
+        Get dynamic TP based on ADX (trend strength)
+        Conservative range: 20-25 pips
+        ADX 25-32: 20 pips (moderate trend)
+        ADX 32+:   25 pips (strong trend)
+        """
+        adx = self.calculate_adx(df, current_idx, period=14)
+
+        if adx >= 32:
+            return 25  # Strong trend
+        else:  # 25-32
+            return 20  # Moderate trend
+
+
+    def is_high_volatility_recent(self, df, current_idx, lookback=4):
+        """
+        Check if there was high volatility in recent candles
+        High volatility = any candle in last 4 candles with 2x+ average range
+        """
+        if current_idx < lookback + 14:
             return False
 
-        # Calculate average ATR over longer period (50 candles)
-        if current_idx < 50:
-            return False
+        # Calculate average ATR from last 20 candles
+        atr_sum = 0
+        for i in range(current_idx - 20, current_idx):
+            candle = df.iloc[i]
+            candle_range = candle['high'] - candle['low']
+            atr_sum += candle_range
+        avg_range = atr_sum / 20
 
-        atr_values = []
-        for i in range(current_idx - 50, current_idx):
-            atr = self.calculate_atr(df, i)
-            if atr is not None:
-                atr_values.append(atr)
+        # Check last 4 candles for volatility spike (2x threshold)
+        for i in range(current_idx - lookback, current_idx):
+            candle = df.iloc[i]
+            candle_range = candle['high'] - candle['low']
+            if candle_range > avg_range * 2:
+                return True  # Extreme volatility detected in recent candles
 
-        if not atr_values:
-            return False
+        return False
 
-        avg_atr = sum(atr_values) / len(atr_values)
-
-        # High volatility if current ATR > multiplier * average ATR
-        return current_atr > (self.atr_multiplier * avg_atr)
-
-
-    def is_trading_hours(self, timestamp):
+    def is_trading_hours(self, timestamp, df=None, current_idx=None):
         """
         Check if current time is within trading hours (13:00-19:55)
         AND not during news blackout period
+        AND not during choppy market conditions (ADX filter)
+        AND not after recent high volatility (ATR filter)
         """
         hour = timestamp.hour
         minute = timestamp.minute
@@ -262,6 +430,16 @@ class TrendFollowingStrategy:
             is_news, event = self.news_filter.is_news_time(timestamp)
             if is_news:
                 return False  # Block trading during news
+
+        # Check choppy market filter (ADX-based, threshold 25)
+        if df is not None and current_idx is not None:
+            if self.is_choppy_market(timestamp, df, current_idx):
+                return False  # Block trading during choppy conditions
+
+        # Check recent high volatility filter (ATR-based)
+        if df is not None and current_idx is not None:
+            if self.is_high_volatility_recent(df, current_idx, lookback=4):
+                return False  # Block trading after volatility spike
 
         return True
 
@@ -336,11 +514,16 @@ class TrendFollowingStrategy:
             if candle['low'] < self.reference_low:
                 # Find the highest pending swing high
                 highest_swing = max(self.pending_swing_highs, key=lambda x: x[0])
-                self.reference_high = highest_swing[0]
-                self.reference_high_idx = highest_swing[1]
+                new_high = highest_swing[0]
+                new_high_idx = highest_swing[1]
+
+                # Always update reference level to track market structure
+                old_ref_high = self.reference_high
+                self.reference_high = new_high
+                self.reference_high_idx = new_high_idx
                 self.pending_swing_highs = []  # Clear all pending
 
-                # Update mitigation if in LONG bias
+                # LONG bias: Always update mitigation on any new swing high
                 if self.bias == 'LONG':
                     self.update_mitigation_for_new_high(df, self.reference_high_idx)
 
@@ -350,11 +533,16 @@ class TrendFollowingStrategy:
             if candle['high'] > self.reference_high:
                 # Find the lowest pending swing low
                 lowest_swing = min(self.pending_swing_lows, key=lambda x: x[0])
-                self.reference_low = lowest_swing[0]
-                self.reference_low_idx = lowest_swing[1]
+                new_low = lowest_swing[0]
+                new_low_idx = lowest_swing[1]
+
+                # Always update reference level to track market structure
+                old_ref_low = self.reference_low
+                self.reference_low = new_low
+                self.reference_low_idx = new_low_idx
                 self.pending_swing_lows = []  # Clear all pending
 
-                # Update mitigation if in SHORT bias
+                # SHORT bias: Always update mitigation on any new swing low
                 if self.bias == 'SHORT':
                     self.update_mitigation_for_new_low(df, self.reference_low_idx)
 
@@ -448,17 +636,60 @@ class TrendFollowingStrategy:
 
                 changed = True
 
+                # Reset ready_to_trade on bias change and mark bias change
+                self.ready_to_trade = False
+                self.mitigation_tested = False
+                self.entry_candle_count = 0
+                self.last_bias_change_idx = current_idx
+
         return changed
 
+    def check_mitigation_test(self, candle):
+        """
+        Check if price has entered mitigation zone after bias change
+        Mitigation zone is set when bias changes
+        """
+        if self.mitigation_high is None or self.mitigation_low is None:
+            return
+
+        # Only track mitigation test if we haven't tested yet
+        if self.mitigation_tested:
+            return
+
+        # Check if price is inside mitigation zone
+        if self.bias == 'LONG':
+            # For LONG, check if price touched or entered mitigation
+            if candle['low'] <= self.mitigation_high:
+                self.mitigation_tested = True
+        elif self.bias == 'SHORT':
+            # For SHORT, check if price touched or entered mitigation
+            if candle['high'] >= self.mitigation_low:
+                self.mitigation_tested = True
 
     def should_enter(self, candle):
         """
         Check if we should enter a trade on this candle
-        Entry: ALL candles when bias is active (color independent)
+        Entry: When bias is active and mitigation is set
         """
-        if self.bias in ['LONG', 'SHORT']:
+        if self.bias in ['LONG', 'SHORT'] and self.mitigation_high is not None and self.mitigation_low is not None:
             return True
         return False
+
+    def get_tp_pips_for_entry_candle(self):
+        """
+        Get TP in pips based on which entry candle this is
+        Candle 1: 25 pips
+        Candle 2: 20 pips
+        Candle 3: 15 pips
+        """
+        if self.entry_candle_count == 0:
+            return 25
+        elif self.entry_candle_count == 1:
+            return 20
+        elif self.entry_candle_count == 2:
+            return 15
+        else:
+            return 15  # Fallback
 
 
     def get_entry_price(self, candle):
@@ -477,8 +708,8 @@ class TrendFollowingStrategy:
     def calculate_position_size(self, balance, entry_price, symbol):
         """
         Calculate position size based on risk
-        Risk = balance * risk_per_trade
-        SL = mitigation boundary
+        Risk = balance * risk_per_trade (0.2% = 0.002)
+        SL = mitigation boundary (max 3.5% of balance)
         """
         sl_price = self.get_sl_price()
 
@@ -491,23 +722,53 @@ class TrendFollowingStrategy:
         if sl_distance == 0:
             return 0
 
-        # Risk amount in dollars
+        # Risk amount in dollars (0.2% of balance)
         risk_amount = balance * self.risk_per_trade
 
-        # Pip size
-        if 'JPY' in symbol:
-            pip_size = 0.01
+        # Gold (XAU) specific calculation
+        if 'XAU' in symbol or 'GOLD' in symbol.upper():
+            # For gold: 1 lot = 100 oz, $1 move = $100 per lot
+            # SL distance is in dollars (e.g., if gold moves $10, that's $10)
+            # Dollar value per lot for $1 move = 100
+            dollar_value_per_lot = 100
+
+            # Lot size = risk / (sl_distance * dollar_value_per_lot)
+            lot_size = risk_amount / (sl_distance * dollar_value_per_lot)
+            lot_size = round(lot_size, 2)
+
+            # Check max SL
+            max_sl_amount = balance * self.max_stop_loss_percent
+            potential_loss = lot_size * sl_distance * dollar_value_per_lot
+
+            if potential_loss > max_sl_amount:
+                lot_size = max_sl_amount / (sl_distance * dollar_value_per_lot)
+                lot_size = round(lot_size, 2)
+
+        # Forex pairs (EURUSD, GBPUSD, etc.)
         else:
-            pip_size = 0.0001
+            # Pip size
+            if 'JPY' in symbol:
+                pip_size = 0.01
+            else:
+                pip_size = 0.0001
 
-        pip_value_per_lot = 10  # Standard lot
+            pip_value_per_lot = 10  # Standard lot
 
-        # SL distance in pips
-        sl_pips = sl_distance / pip_size
+            # SL distance in pips
+            sl_pips = sl_distance / pip_size
 
-        # Lot size
-        lot_size = risk_amount / (sl_pips * pip_value_per_lot)
-        lot_size = round(lot_size, 2)
+            # Lot size based on risk
+            lot_size = risk_amount / (sl_pips * pip_value_per_lot)
+            lot_size = round(lot_size, 2)
+
+            # Check if SL would exceed max allowed (3.5% of balance)
+            max_sl_amount = balance * self.max_stop_loss_percent
+            potential_loss = lot_size * sl_pips * pip_value_per_lot
+
+            if potential_loss > max_sl_amount:
+                # Reduce lot size to meet max SL requirement
+                lot_size = max_sl_amount / (sl_pips * pip_value_per_lot)
+                lot_size = round(lot_size, 2)
 
         # Minimum lot size
         if lot_size < 0.01:

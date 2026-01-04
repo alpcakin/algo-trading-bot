@@ -17,8 +17,8 @@ from config import *
 class Position:
     """Represents a single trading position"""
     
-    def __init__(self, entry_time, entry_price, direction, lot_size, 
-                 sl_price, tp_pips, symbol, position_id):
+    def __init__(self, entry_time, entry_price, direction, lot_size,
+                 sl_price, tp_pips, symbol, position_id, spread_pips=0):
         self.position_id = position_id
         self.entry_time = entry_time
         self.entry_price = entry_price
@@ -26,15 +26,23 @@ class Position:
         self.lot_size = lot_size
         self.sl_price = sl_price
         self.symbol = symbol
-        
-        # Calculate TP price
-        pip_size = 0.01 if 'JPY' in symbol else 0.0001
-        tp_distance = tp_pips * pip_size
-        
-        if direction == 'LONG':
-            self.tp_price = entry_price + tp_distance
+        self.spread_pips = spread_pips
+
+        # Calculate TP price (if tp_pips provided)
+        if tp_pips is not None:
+            # Gold: 1 pip = $1, use tp_pips directly as dollar amount
+            if 'XAU' in symbol or 'GOLD' in symbol.upper():
+                tp_distance = tp_pips  # For gold, tp_pips is in dollars
+            else:
+                pip_size = 0.01 if 'JPY' in symbol else 0.0001
+                tp_distance = tp_pips * pip_size
+
+            if direction == 'LONG':
+                self.tp_price = entry_price + tp_distance
+            else:
+                self.tp_price = entry_price - tp_distance
         else:
-            self.tp_price = entry_price - tp_distance
+            self.tp_price = None  # No TP
         
         # Status
         self.status = 'OPEN'
@@ -46,6 +54,8 @@ class Position:
     
     def check_tp_hit(self, candle):
         """Check if TP was hit during this candle"""
+        if self.tp_price is None:
+            return False
         if self.direction == 'LONG':
             return candle['high'] >= self.tp_price
         else:
@@ -68,19 +78,38 @@ class Position:
         self.exit_time = exit_time
         self.exit_price = exit_price
         self.exit_reason = exit_reason
-        
+
         # Calculate P&L
-        pip_size = 0.01 if 'JPY' in self.symbol else 0.0001
-        pip_value_per_lot = 10  # Standard lot
-        
-        if self.direction == 'LONG':
-            pips = (exit_price - self.entry_price) / pip_size
+        if 'XAU' in self.symbol or 'GOLD' in self.symbol.upper():
+            # Gold: 1 lot = 100 oz, $1 move = $100 per lot
+            dollar_value_per_lot = 100
+
+            if self.direction == 'LONG':
+                dollar_move = exit_price - self.entry_price
+            else:
+                dollar_move = self.entry_price - exit_price
+
+            # Subtract spread cost (in dollars)
+            dollar_move -= self.spread_pips
+
+            # P&L = dollar_move * lot_size * dollar_value_per_lot
+            self.pnl = dollar_move * self.lot_size * dollar_value_per_lot
         else:
-            pips = (self.entry_price - exit_price) / pip_size
-        
-        # P&L = pips * lot_size * pip_value
-        self.pnl = pips * self.lot_size * pip_value_per_lot
-        
+            # Forex pairs
+            pip_size = 0.01 if 'JPY' in self.symbol else 0.0001
+            pip_value_per_lot = 10  # Standard lot
+
+            if self.direction == 'LONG':
+                pips = (exit_price - self.entry_price) / pip_size
+            else:
+                pips = (self.entry_price - exit_price) / pip_size
+
+            # Subtract spread cost (both entry and exit)
+            pips -= self.spread_pips
+
+            # P&L = pips * lot_size * pip_value
+            self.pnl = pips * self.lot_size * pip_value_per_lot
+
         return self.pnl
 
 
@@ -100,11 +129,11 @@ class Backtester:
         self.equity_curve = []
         
     
-    def open_position(self, entry_time, entry_price, direction, lot_size, 
-                      sl_price, tp_pips):
+    def open_position(self, entry_time, entry_price, direction, lot_size,
+                      sl_price, tp_pips, spread_pips=0):
         """Open a new position"""
         self.position_counter += 1
-        
+
         position = Position(
             entry_time=entry_time,
             entry_price=entry_price,
@@ -113,12 +142,13 @@ class Backtester:
             sl_price=sl_price,
             tp_pips=tp_pips,
             symbol=self.symbol,
-            position_id=self.position_counter
+            position_id=self.position_counter,
+            spread_pips=spread_pips
         )
-        
+
         self.positions.append(position)
         self.open_positions.append(position)
-        
+
         return position
     
     
@@ -150,16 +180,16 @@ class Backtester:
         """
         for position in self.open_positions[:]:  # Copy to avoid modification issues
 
-            # 1. Check individual TP
-            if position.check_tp_hit(candle):
+            # 1. Check individual TP (if enabled)
+            if position.tp_price is not None and position.check_tp_hit(candle):
                 self.close_position(position, candle['time'], position.tp_price, 'TP_HIT')
                 continue
 
-            # 2. Check if bias changed (opposite to position direction)
-            if (position.direction == 'LONG' and current_bias == 'SHORT') or \
-               (position.direction == 'SHORT' and current_bias == 'LONG'):
-                self.close_position(position, candle['time'], candle['close'], 'BIAS_CHANGE')
-                continue
+            # 2. BIAS_CHANGE DISABLED - close positions only at TP or SL
+            # if (position.direction == 'LONG' and current_bias == 'SHORT') or \
+            #    (position.direction == 'SHORT' and current_bias == 'LONG'):
+            #     self.close_position(position, candle['time'], candle['close'], 'BIAS_CHANGE')
+            #     continue
 
             # 3. Check SL (mitigation break - body close)
             if position.check_sl_hit(candle, mitigation_high, mitigation_low):
@@ -274,15 +304,19 @@ def run_backtest(df, symbol, initial_balance, strategy_params):
             strategy.mitigation_low
         )
 
-        # Entry logic: during trading hours, if mitigation is set, and NOT high volatility
-        if strategy.is_trading_hours(candle['time']) and strategy.should_enter(candle):
-            # Check volatility filter
-            if strategy.is_high_volatility(df, i):
-                continue  # Skip entry during high volatility
+        # Entry logic: during trading hours (with ADX filter), if mitigation is set
+        if strategy.is_trading_hours(candle['time'], df, i) and strategy.should_enter(candle):
+            # Check max position limit (if set)
+            from config import MAX_OPEN_POSITIONS, SPREAD_PIPS
+            if MAX_OPEN_POSITIONS is not None and len(backtester.open_positions) >= MAX_OPEN_POSITIONS:
+                continue  # Skip entry if max positions reached
 
             if strategy.mitigation_high is not None and strategy.mitigation_low is not None:
                 entry_price = strategy.get_entry_price(candle)
                 lot_size = strategy.calculate_position_size(backtester.balance, entry_price, symbol)
+
+                # Use fixed 25 pip TP
+                dynamic_tp = 25
 
                 if lot_size > 0:
                     backtester.open_position(
@@ -291,7 +325,8 @@ def run_backtest(df, symbol, initial_balance, strategy_params):
                         direction=strategy.bias,
                         lot_size=lot_size,
                         sl_price=strategy.get_sl_price(),
-                        tp_pips=strategy.individual_tp_pips
+                        tp_pips=dynamic_tp,  # Use dynamic TP instead of fixed
+                        spread_pips=SPREAD_PIPS
                     )
         
         # Track equity
@@ -340,33 +375,38 @@ def print_stats(stats):
 
 
 if __name__ == "__main__":
-    # Load data
+    # Load M15 data
     symbol = "EURUSD"
-    df = pd.read_csv(f"data/raw/{symbol}_M1_{START_DATE}_{END_DATE}.csv")
+
+    # TESTING NOVEMBER 2025
+    df = pd.read_csv(f"data/raw/{symbol}_M15_2025-11-01_2025-11-30.csv")
     df['time'] = pd.to_datetime(df['time'])
-    
+
+    print(f"Loaded M15 data (NOVEMBER 2025): {len(df)} candles")
+
     # Strategy parameters
     strategy_params = {
         'individual_tp_pips': INDIVIDUAL_TP_PIPS,
         'risk_per_trade': RISK_PER_TRADE,
-        'emergency_sl_percent': EMERGENCY_SL_PERCENT,
+        'max_stop_loss_percent': MAX_STOP_LOSS_PERCENT,
         'trading_hours': TRADING_HOURS,
         'analysis_hours': ANALYSIS_HOURS,
-        'min_mitigation_distance_pips': MIN_MITIGATION_DISTANCE_PIPS,
         'swing_lookback': SWING_LOOKBACK,
         'enable_news_filter': ENABLE_NEWS_FILTER,
         'news_buffer_before': NEWS_BEFORE_MINUTES,
-        'news_buffer_after': NEWS_AFTER_MINUTES,
-        'enable_volatility_filter': ENABLE_VOLATILITY_FILTER,
-        'atr_period': ATR_PERIOD,
-        'atr_multiplier': ATR_MULTIPLIER
+        'news_buffer_after': NEWS_AFTER_MINUTES
     }
-    
+
     # Run backtest
     backtester, stats = run_backtest(df, symbol, INITIAL_BALANCE, strategy_params)
-    
+
     # Print results
     if stats:
         print_stats(stats)
+
+        # Additional M15 specific info
+        print(f"\nM15 TIMEFRAME INFO:")
+        print(f"Total candles: {len(df)}")
+        print(f"Trades per candle: {stats['total_trades'] / len(df):.2f}")
     else:
         print("No trades executed!")

@@ -85,6 +85,16 @@ class NewsFilter:
         if isinstance(timestamp, pd.Timestamp):
             timestamp = timestamp.to_pydatetime()
 
+        # Check if it's FOMC day or NFP day - block entire day
+        current_date = timestamp.date()
+        for news_time, event_name in self.news_events:
+            if 'FOMC' in event_name and news_time.date() == current_date:
+                return True, f"FOMC_DAY_{event_name}"
+            if 'NFP' in event_name or 'Non-Farm Employment Change' in event_name:
+                if news_time.date() == current_date:
+                    return True, f"NFP_DAY_{event_name}"
+
+        # Regular news buffer check
         for news_time, event_name in self.news_events:
             # Check if within buffer zone
             time_diff = (timestamp - news_time).total_seconds() / 60  # minutes
@@ -133,55 +143,30 @@ class NewsFilter:
         self.news_events = []
 
 
-# Specific high-impact news for December 2025
+# Specific high-impact news for November 2025
 # Source: Forex Factory Calendar (provided by user)
-# TIMES IN UTC (Forex Factory shows UTC, converted to match MT5 data timezone)
+# TIMES IN UTC (Budapest time + 1 hour converted to UTC)
 # Only HIGH IMPACT (red/3-star) events included
 KNOWN_NEWS_2025_2026 = [
-    # December 2025 - High Impact Events Only (all times +2 hours corrected)
-    (datetime(2025, 12, 1, 17, 0), "ISM Manufacturing PMI"),  # 4:00pm UTC on ForexFactory
-    (datetime(2025, 12, 3, 15, 15), "ADP Non-Farm Employment Change"),  # 2:15pm UTC
-    (datetime(2025, 12, 3, 17, 0), "ISM Services PMI"),  # 4:00pm UTC
-    (datetime(2025, 12, 4, 15, 30), "Unemployment Claims"),  # 2:30pm UTC
-    (datetime(2025, 12, 5, 17, 0), "Core PCE Price Index"),  # 4:00pm UTC
-    (datetime(2025, 12, 5, 17, 0), "Prelim UoM Consumer Sentiment"),  # 4:00pm UTC
-    (datetime(2025, 12, 5, 17, 0), "Prelim UoM Inflation Expectations"),  # 4:00pm UTC
-    (datetime(2025, 12, 9, 15, 15), "ADP Weekly Employment Change"),  # 2:15pm UTC
-    (datetime(2025, 12, 9, 17, 0), "JOLTS Job Openings"),  # 4:00pm UTC
-    (datetime(2025, 12, 10, 15, 30), "Employment Cost Index"),  # 2:30pm UTC
-    (datetime(2025, 12, 10, 21, 0), "Federal Funds Rate"),  # 8:00pm UTC - MAJOR
-    (datetime(2025, 12, 10, 21, 0), "FOMC Economic Projections"),  # 8:00pm UTC - MAJOR
-    (datetime(2025, 12, 10, 21, 0), "FOMC Statement"),  # 8:00pm UTC - MAJOR
-    (datetime(2025, 12, 10, 21, 30), "FOMC Press Conference"),  # 8:30pm UTC - MAJOR
-    (datetime(2025, 12, 11, 15, 30), "Unemployment Claims"),  # 2:30pm UTC
-    (datetime(2025, 12, 12, 9, 0), "UK GDP m/m"),  # 8:00am UTC
-    (datetime(2025, 12, 16, 9, 0), "UK Claimant Count Change"),  # 8:00am UTC
-    (datetime(2025, 12, 16, 10, 30), "German Flash Manufacturing PMI"),  # 9:30am UTC
-    (datetime(2025, 12, 16, 10, 30), "German Flash Services PMI"),  # 9:30am UTC
-    (datetime(2025, 12, 16, 11, 30), "UK Flash Manufacturing PMI"),  # 10:30am UTC
-    (datetime(2025, 12, 16, 11, 30), "UK Flash Services PMI"),  # 10:30am UTC
-    (datetime(2025, 12, 16, 15, 15), "ADP Weekly Employment Change"),  # 2:15pm UTC
-    (datetime(2025, 12, 16, 15, 30), "Average Hourly Earnings m/m"),  # 2:30pm UTC - MAJOR
-    (datetime(2025, 12, 16, 15, 30), "Core Retail Sales m/m"),  # 2:30pm UTC
-    (datetime(2025, 12, 16, 15, 30), "Non-Farm Employment Change (NFP)"),  # 2:30pm UTC - MAJOR
-    (datetime(2025, 12, 16, 15, 30), "Retail Sales m/m"),  # 2:30pm UTC
-    (datetime(2025, 12, 16, 15, 30), "Unemployment Rate"),  # 2:30pm UTC - MAJOR
-    (datetime(2025, 12, 16, 16, 45), "Flash Manufacturing PMI"),  # 3:45pm UTC
-    (datetime(2025, 12, 16, 16, 45), "Flash Services PMI"),  # 3:45pm UTC
-    (datetime(2025, 12, 17, 9, 0), "UK CPI y/y"),  # 8:00am UTC
-    (datetime(2025, 12, 18, 14, 0), "BOE Official Bank Rate"),  # 1:00pm UTC - MAJOR
-    (datetime(2025, 12, 18, 14, 0), "MPC Official Bank Rate Votes"),  # 1:00pm UTC - MAJOR
-    (datetime(2025, 12, 18, 14, 0), "Monetary Policy Summary"),  # 1:00pm UTC - MAJOR
-    (datetime(2025, 12, 18, 15, 15), "ECB Main Refinancing Rate"),  # 2:15pm UTC - MAJOR
-    (datetime(2025, 12, 18, 15, 15), "ECB Monetary Policy Statement"),  # 2:15pm UTC - MAJOR
-    (datetime(2025, 12, 18, 15, 30), "US CPI y/y"),  # 2:30pm UTC - MAJOR
-    (datetime(2025, 12, 18, 15, 30), "Unemployment Claims"),  # 2:30pm UTC
-    (datetime(2025, 12, 18, 15, 45), "ECB Press Conference"),  # 2:45pm UTC - MAJOR
-    (datetime(2025, 12, 19, 9, 0), "UK Retail Sales m/m"),  # 8:00am UTC
-    (datetime(2025, 12, 23, 15, 30), "Prelim GDP q/q"),  # 2:30pm UTC
-    (datetime(2025, 12, 24, 15, 30), "Unemployment Claims"),  # 2:30pm UTC
-    (datetime(2025, 12, 30, 21, 0), "FOMC Meeting Minutes"),  # 8:00pm UTC
-    (datetime(2025, 12, 31, 15, 30), "Unemployment Claims"),  # 2:30pm UTC
+    # November 2025 - High Impact Events Only
+    (datetime(2025, 11, 1, 17, 0), "ISM Manufacturing PMI"),  # Budapest 4:00pm → UTC 5:00pm
+    (datetime(2025, 11, 5, 15, 15), "ADP Non-Farm Employment Change"),  # Budapest 2:15pm → UTC 3:15pm
+    (datetime(2025, 11, 5, 17, 0), "ISM Services PMI"),  # Budapest 4:00pm → UTC 5:00pm
+    (datetime(2025, 11, 6, 14, 0), "BOE Monetary Policy Report"),  # Budapest 1:00pm → UTC 2:00pm - MAJOR
+    (datetime(2025, 11, 6, 14, 0), "Monetary Policy Summary"),  # Budapest 1:00pm → UTC 2:00pm - MAJOR
+    (datetime(2025, 11, 6, 14, 0), "MPC Official Bank Rate Votes"),  # Budapest 1:00pm → UTC 2:00pm - MAJOR
+    (datetime(2025, 11, 6, 14, 0), "Official Bank Rate"),  # Budapest 1:00pm → UTC 2:00pm - MAJOR
+    (datetime(2025, 11, 6, 14, 30), "BOE Gov Bailey Speaks"),  # Budapest 1:30pm → UTC 2:30pm - MAJOR
+    (datetime(2025, 11, 11, 9, 0), "Claimant Count Change"),  # Budapest 8:00am → UTC 9:00am
+    (datetime(2025, 11, 13, 9, 0), "GDP m/m"),  # Budapest 8:00am → UTC 9:00am
+    (datetime(2025, 11, 18, 10, 10), "Unemployment Claims"),  # Budapest 9:10am → UTC 10:10am
+    (datetime(2025, 11, 19, 9, 0), "CPI y/y"),  # Budapest 8:00am → UTC 9:00am - MAJOR
+    (datetime(2025, 11, 19, 21, 0), "FOMC Meeting Minutes"),  # Budapest 8:00pm → UTC 9:00pm - MAJOR (FOMC DAY)
+    (datetime(2025, 11, 20, 15, 30), "Average Hourly Earnings m/m"),  # Budapest 2:30pm → UTC 3:30pm - MAJOR
+    (datetime(2025, 11, 20, 15, 30), "Non-Farm Employment Change"),  # Budapest 2:30pm → UTC 3:30pm - MAJOR (NFP)
+    (datetime(2025, 11, 20, 15, 30), "Unemployment Claims"),  # Budapest 2:30pm → UTC 3:30pm
+    (datetime(2025, 11, 20, 15, 30), "Unemployment Rate"),  # Budapest 2:30pm → UTC 3:30pm - MAJOR
+    (datetime(2025, 11, 21, 9, 0), "Retail Sales m/m"),  # Budapest 8:00am → UTC 9:00am
 ]
 
 
